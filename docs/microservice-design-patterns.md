@@ -2171,31 +2171,255 @@ spec:
 
 ## 3. Data Management Patterns
 
-### Database per Service
+### 3.1 Database per Service
+
+**Rule**: Each service OWNS its data. No direct database sharing!
+
 ```
-┌─────────┐    ┌─────────┐    ┌─────────┐
-│Service A│    │Service B│    │Service C│
-└────┬────┘    └────┬────┘    └────┬────┘
-     │              │              │
-┌────▼────┐    ┌────▼────┐    ┌────▼────┐
-│  DB A   │    │  DB B   │    │  DB C   │
-└─────────┘    └─────────┘    └─────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DATABASE PER SERVICE                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐          │
+│   │  ORDER SERVICE  │   │  USER SERVICE   │   │PRODUCT SERVICE  │          │
+│   └────────┬────────┘   └────────┬────────┘   └────────┬────────┘          │
+│            │ OWNS                │ OWNS                │ OWNS               │
+│            ▼                     ▼                     ▼                    │
+│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐          │
+│   │   ORDER DB      │   │    USER DB      │   │   PRODUCT DB    │          │
+│   │   (PostgreSQL)  │   │   (PostgreSQL)  │   │   (MongoDB)     │          │
+│   └─────────────────┘   └─────────────────┘   └─────────────────┘          │
+│                                                                             │
+│   ❌ Order Service CANNOT directly query User DB                            │
+│   ✅ Services communicate via APIs or Events                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
-- Each service owns its data exclusively
-- No direct database sharing between services
 
-### Saga Pattern
-- Manages distributed transactions across services
-- **Choreography**: Services react to events
-- **Orchestration**: Central coordinator manages the flow
+**Benefits:**
+- ✅ Loose coupling - services evolve independently
+- ✅ Independent scaling
+- ✅ Technology freedom (Polyglot Persistence)
+- ✅ Fault isolation
 
-### CQRS (Command Query Responsibility Segregation)
-- Separate read and write models
-- Optimized for high-read or complex query scenarios
+**Challenge:** No cross-service transactions → **Saga Pattern** solves this!
 
-### Event Sourcing
-- Store state changes as a sequence of events
-- Rebuild state by replaying events
+---
+
+### 3.2 Saga Pattern (Distributed Business Transactions)
+
+**Definition**: Pattern to accomplish **DISTRIBUTED BUSINESS TRANSACTIONS** across multiple services.
+
+**Important Distinction:**
+- **Business Transaction** ≠ Database Transaction
+- Business Transaction = Multiple DB transactions across different services
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BUSINESS TRANSACTION                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   "Place Order" = ONE Business Transaction spanning:                        │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐            │   │
+│   │  │ DB Tx 1 │ + │ DB Tx 2 │ + │ DB Tx 3 │ + │ DB Tx 4 │            │   │
+│   │  │ Order   │   │Inventory│   │ Payment │   │Shipping │            │   │
+│   │  │ Service │   │ Service │   │ Service │   │ Service │            │   │
+│   │  └─────────┘   └─────────┘   └─────────┘   └─────────┘            │   │
+│   │                                                                     │   │
+│   │  4 Services, 4 DBs, 4 DB Transactions = 1 Business Transaction     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Saga ID / Correlation ID
+
+**Same ID across ALL services** to identify and rollback related records:
+
+```sql
+-- ALL tables have saga_id for correlation
+CREATE TABLE orders (
+    order_id VARCHAR(50) PRIMARY KEY,
+    saga_id  VARCHAR(50) NOT NULL,  -- Same across all services!
+    status   VARCHAR(20)
+);
+
+CREATE TABLE inventory_reservations (
+    reservation_id VARCHAR(50) PRIMARY KEY,
+    saga_id        VARCHAR(50) NOT NULL,  -- Same ID!
+    status         VARCHAR(20)
+);
+
+CREATE TABLE payments (
+    payment_id VARCHAR(50) PRIMARY KEY,
+    saga_id    VARCHAR(50) NOT NULL,  -- Same ID!
+    status     VARCHAR(20)
+);
+
+-- ROLLBACK by saga_id
+UPDATE orders SET status='CANCELLED' WHERE saga_id = 'SAGA-12345';
+UPDATE inventory_reservations SET status='RELEASED' WHERE saga_id = 'SAGA-12345';
+UPDATE payments SET status='REFUNDED' WHERE saga_id = 'SAGA-12345';
+```
+
+#### Choreography vs Orchestration
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SAGA IMPLEMENTATION STYLES                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   CHOREOGRAPHY (Event-based)            ORCHESTRATION (Coordinator-based)   │
+│   ──────────────────────────            ─────────────────────────────────   │
+│                                                                             │
+│   Services react to events              Central coordinator controls flow   │
+│   No central controller                 Orchestrator manages state          │
+│   Like a DANCE                          Like an ORCHESTRA                   │
+│                                                                             │
+│   ┌───────┐ Event  ┌───────┐ Event      ┌─────────────┐                    │
+│   │Order  │───────►│Invent │───────►    │ Orchestrator│                    │
+│   │Service│        │Service│            └──────┬──────┘                    │
+│   └───────┘        └───────┘                   │                           │
+│       ▲                │                 ┌─────┴─────┐                     │
+│       └────────────────┘                 ▼     ▼     ▼                     │
+│       (Events flow)                    Order Invent Payment                │
+│                                        (Coordinator calls each)            │
+│                                                                             │
+│   ✅ Loose coupling                     ✅ Clear visibility                 │
+│   ✅ No single point of failure         ✅ Easier debugging                 │
+│   ❌ Hard to track flow                 ❌ Orchestrator is SPOF             │
+│                                                                             │
+│   Best for: 2-4 services                Best for: 5+ services               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### SagaState (Plain Object)
+
+Just a simple POJO to track which steps completed:
+
+```java
+@Data
+public class SagaState {
+    private String sagaId;
+    private String orderId;
+    private boolean orderCreated;      // Step 1
+    private boolean stockReserved;     // Step 2
+    private boolean paymentProcessed;  // Step 3
+    private boolean shipmentCreated;   // Step 4
+}
+
+// Used by orchestrator to know what to rollback
+private void compensate(SagaState state) {
+    if (state.isPaymentProcessed()) paymentService.refundBySagaId(state.getSagaId());
+    if (state.isStockReserved()) inventoryService.releaseBySagaId(state.getSagaId());
+    if (state.isOrderCreated()) orderService.cancelBySagaId(state.getSagaId());
+}
+```
+
+---
+
+### 3.3 CQRS (Command Query Responsibility Segregation)
+
+**Definition**: Separate the **READ database** and **WRITE database**. Databases may be **DIFFERENT types**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CQRS PATTERN                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   COMMAND = Write operations (Create, Update, Delete)                       │
+│   QUERY   = Read operations (Select, Search, Get)                           │
+│   SEGREGATION = Separate them!                                              │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                     │   │
+│   │   COMMANDS (Write)                    QUERIES (Read)                │   │
+│   │        │                                    │                       │   │
+│   │        ▼                                    ▼                       │   │
+│   │   ┌─────────────┐                    ┌─────────────┐                │   │
+│   │   │  WRITE DB   │       SYNC         │  READ DB    │                │   │
+│   │   │ PostgreSQL  │ ──────────────────►│Elasticsearch│                │   │
+│   │   │ (Normalized)│    (Events/CDC)    │(Denormalized)│               │   │
+│   │   └─────────────┘                    └─────────────┘                │   │
+│   │                                                                     │   │
+│   │   CAN BE DIFFERENT DATABASE TYPES!                                  │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### CQRS vs Read Replicas
+
+| Aspect | Read Replicas | Full CQRS |
+|--------|---------------|-----------|
+| Schema | SAME | DIFFERENT (optimized) |
+| Database Type | SAME (RDS → RDS) | Can be DIFFERENT (PostgreSQL → Elasticsearch) |
+| Data | Exact copy | Transformed/Denormalized |
+| Sync | Automatic (DB handles) | Manual (Events/CDC) |
+| Complexity | Low | Higher |
+| Use Case | Scale same queries | Different query patterns, complex search |
+
+#### Common CQRS Database Combinations
+
+| Write DB | Read DB | Use Case |
+|----------|---------|----------|
+| PostgreSQL | Elasticsearch | Full-text search |
+| PostgreSQL | Redis | Fast lookups, caching |
+| PostgreSQL | MongoDB | Flexible document queries |
+| MySQL | ClickHouse | Analytics, OLAP |
+| Any | Same DB (Replica) | Simple read scaling |
+
+#### When to Use CQRS
+
+```
+USE READ REPLICAS (Simple):           USE FULL CQRS:
+• Same queries, more volume           • Read/write patterns very different
+• Schema works for both               • Complex search requirements
+• Want automatic sync                 • Need denormalized read models
+• Strong consistency needed           • Different DB types needed
+```
+
+---
+
+### 3.4 Event Sourcing
+
+**Definition**: Store state changes as a **sequence of events**. Rebuild state by replaying events.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    EVENT SOURCING                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   TRADITIONAL (Store current state):                                        │
+│   ─────────────────────────────────                                         │
+│   Account: { id: 123, balance: 500 }                                        │
+│                                                                             │
+│   EVENT SOURCING (Store all events):                                        │
+│   ───────────────────────────────────                                       │
+│   Event 1: AccountCreated { id: 123, balance: 0 }                           │
+│   Event 2: MoneyDeposited { id: 123, amount: 1000 }                         │
+│   Event 3: MoneyWithdrawn { id: 123, amount: 300 }                          │
+│   Event 4: MoneyWithdrawn { id: 123, amount: 200 }                          │
+│                                                                             │
+│   Current State = Replay all events → balance: 500                          │
+│                                                                             │
+│   BENEFITS:                                                                 │
+│   ✅ Complete audit trail                                                   │
+│   ✅ Time travel (state at any point)                                       │
+│   ✅ Event replay for debugging                                             │
+│   ✅ Natural fit with CQRS                                                  │
+│                                                                             │
+│   CHALLENGES:                                                               │
+│   ❌ Complex to implement                                                   │
+│   ❌ Event schema evolution                                                 │
+│   ❌ Eventual consistency                                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -2780,19 +3004,459 @@ order = order_service_stub.GetOrder(
 
 ---
 
+## 10. Data Management Patterns (Detailed)
+
+### 10.1 Database Per Service Pattern
+
+**Rule**: Each service OWNS its data. No direct database sharing!
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DATABASE PER SERVICE                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐          │
+│   │  ORDER SERVICE  │   │  USER SERVICE   │   │PRODUCT SERVICE  │          │
+│   └────────┬────────┘   └────────┬────────┘   └────────┬────────┘          │
+│            │ OWNS                │ OWNS                │ OWNS               │
+│            ▼                     ▼                     ▼                    │
+│   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐          │
+│   │   ORDER DB      │   │    USER DB      │   │   PRODUCT DB    │          │
+│   │   (PostgreSQL)  │   │   (PostgreSQL)  │   │   (MongoDB)     │          │
+│   └─────────────────┘   └─────────────────┘   └─────────────────┘          │
+│                                                                             │
+│   ❌ Order Service CANNOT directly query User DB                            │
+│   ✅ Services communicate via APIs or Events                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits:**
+- ✅ Loose coupling - services can evolve independently
+- ✅ Independent scaling - scale each DB separately
+- ✅ Technology freedom (Polyglot Persistence)
+- ✅ Fault isolation
+
+**Challenge:** No cross-service JOINs, distributed transactions → Saga Pattern solves this!
+
+---
+
+### 10.2 Saga Pattern - Distributed Business Transactions
+
+**Definition**: Saga is a pattern to accomplish **DISTRIBUTED BUSINESS TRANSACTIONS** across multiple microservices. 
+
+**Important**: A Business Transaction ≠ Database Transaction
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│           BUSINESS TRANSACTION vs DATABASE TRANSACTION                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   DATABASE TRANSACTION:                 BUSINESS TRANSACTION:               │
+│   • Single database                     • Multiple services                 │
+│   • ACID                                • Multiple databases                │
+│   • BEGIN...COMMIT                      • Multiple DB transactions          │
+│   • Milliseconds                        • Can take seconds/minutes          │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │     BUSINESS TRANSACTION: "Place Order"                             │   │
+│   │                                                                     │   │
+│   │  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐            │   │
+│   │  │ DB Tx 1 │ + │ DB Tx 2 │ + │ DB Tx 3 │ + │ DB Tx 4 │            │   │
+│   │  │ Order   │   │Inventory│   │ Payment │   │Shipping │            │   │
+│   │  │ Service │   │ Service │   │ Service │   │ Service │            │   │
+│   │  └─────────┘   └─────────┘   └─────────┘   └─────────┘            │   │
+│   │                                                                     │   │
+│   │  4 Services, 4 DBs, 4 DB Transactions = 1 Business Transaction     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Saga ID / Correlation ID**: Same ID across all services to identify and rollback related records:
+
+```sql
+-- All tables have saga_id for correlation
+CREATE TABLE orders (
+    order_id VARCHAR(50) PRIMARY KEY,
+    saga_id  VARCHAR(50) NOT NULL,  -- Same across services!
+    status   VARCHAR(20)
+);
+
+CREATE TABLE inventory_reservations (
+    reservation_id VARCHAR(50) PRIMARY KEY,
+    saga_id        VARCHAR(50) NOT NULL,  -- Same ID!
+    status         VARCHAR(20)
+);
+
+CREATE TABLE payments (
+    payment_id VARCHAR(50) PRIMARY KEY,
+    saga_id    VARCHAR(50) NOT NULL,  -- Same ID!
+    status     VARCHAR(20)
+);
+
+-- Rollback by saga_id
+UPDATE orders SET status='CANCELLED' WHERE saga_id = 'SAGA-12345';
+UPDATE inventory_reservations SET status='RELEASED' WHERE saga_id = 'SAGA-12345';
+UPDATE payments SET status='REFUNDED' WHERE saga_id = 'SAGA-12345';
+```
+
+#### Choreography vs Orchestration
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SAGA IMPLEMENTATION STYLES                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   CHOREOGRAPHY (Event-based)            ORCHESTRATION (Coordinator-based)   │
+│   ──────────────────────────            ─────────────────────────────────   │
+│                                                                             │
+│   Services react to events              Central coordinator controls flow   │
+│   No central controller                 Orchestrator manages state          │
+│   Like a DANCE                          Like an ORCHESTRA                   │
+│                                                                             │
+│   Order ──► Inventory ──► Payment       Orchestrator ──► Order              │
+│     │          │            │                │──────────► Inventory         │
+│     │          │            │                │──────────► Payment           │
+│     ◄──────────◄────────────┘                                               │
+│   (Events flow between services)        (Coordinator calls each service)    │
+│                                                                             │
+│   ✅ Loose coupling                     ✅ Clear visibility                 │
+│   ✅ No single point of failure         ✅ Easier debugging                 │
+│   ❌ Hard to track flow                 ❌ Orchestrator is SPOF             │
+│   ❌ Complex for many steps             ✅ Good for complex flows           │
+│                                                                             │
+│   Best for: 2-4 services                Best for: 5+ services               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**SagaState**: Just a plain POJO to track completed steps:
+
+```java
+@Data
+public class SagaState {
+    private String sagaId;
+    private String orderId;
+    private boolean orderCreated;
+    private boolean stockReserved;
+    private boolean paymentProcessed;
+    private boolean shipmentCreated;
+}
+```
+
+---
+
+### 10.3 CQRS (Command Query Responsibility Segregation)
+
+**Definition**: Separate the READ database and WRITE database. Databases may also be DIFFERENT types.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CQRS PATTERN                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   COMMAND = Write operations (Create, Update, Delete)                       │
+│   QUERY   = Read operations (Select, Search, Get)                           │
+│   SEGREGATION = Separate them!                                              │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                     │   │
+│   │   COMMANDS (Write)                    QUERIES (Read)                │   │
+│   │        │                                    │                       │   │
+│   │        ▼                                    ▼                       │   │
+│   │   ┌─────────────┐                    ┌─────────────┐                │   │
+│   │   │  WRITE DB   │       SYNC         │  READ DB    │                │   │
+│   │   │ PostgreSQL  │ ──────────────────►│Elasticsearch│                │   │
+│   │   │ (Normalized)│    (Events/CDC)    │(Denormalized)│               │   │
+│   │   └─────────────┘                    └─────────────┘                │   │
+│   │                                                                     │   │
+│   │   CAN BE DIFFERENT DATABASE TYPES!                                  │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**CQRS vs Read Replicas:**
+
+| Aspect | Read Replicas | Full CQRS |
+|--------|---------------|-----------|
+| Schema | SAME | DIFFERENT (optimized) |
+| Database Type | SAME | Can be DIFFERENT |
+| Data | Exact copy | Transformed/Denormalized |
+| Sync | Automatic (DB handles) | Manual (Events/CDC) |
+| Use Case | Scale same queries | Different query patterns |
+
+**Common CQRS Database Combinations:**
+
+| Write DB | Read DB | Use Case |
+|----------|---------|----------|
+| PostgreSQL | Elasticsearch | Full-text search |
+| PostgreSQL | Redis | Fast lookups, caching |
+| MySQL | ClickHouse | Analytics, reporting |
+| MongoDB | Elasticsearch | Search optimization |
+
+---
+
+## 11. Service Mesh Pattern
+
+**Definition**: Infrastructure layer for service-to-service communication. Control traffic, security, and observability **WITHOUT changing application code**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SERVICE MESH ARCHITECTURE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│                          CONTROL PLANE                                      │
+│                    ┌─────────────────────────┐                              │
+│                    │   Istio / Linkerd       │  ← Configuration (YAML)      │
+│                    │   • Policy Rules        │    NO code changes!          │
+│                    │   • Certificate Mgmt    │                              │
+│                    └───────────┬─────────────┘                              │
+│                                │                                            │
+│              ┌─────────────────┼─────────────────┐                          │
+│              ▼                 ▼                 ▼                          │
+│   ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐              │
+│   │   SERVICE A     │ │   SERVICE B     │ │   SERVICE C     │              │
+│   │  ┌───────────┐  │ │  ┌───────────┐  │ │  ┌───────────┐  │              │
+│   │  │   App     │  │ │  │   App     │  │ │  │   App     │  │              │
+│   │  └─────┬─────┘  │ │  └─────┬─────┘  │ │  └─────┬─────┘  │              │
+│   │  ┌─────▼─────┐  │ │  ┌─────▼─────┐  │ │  ┌─────▼─────┐  │              │
+│   │  │  SIDECAR  │◄─┼─┼─►│  SIDECAR  │◄─┼─┼─►│  SIDECAR  │  │              │
+│   │  │  (Envoy)  │  │ │  │  (Envoy)  │  │ │  │  (Envoy)  │  │              │
+│   │  └───────────┘  │ │  └───────────┘  │ │  └───────────┘  │              │
+│   └─────────────────┘ └─────────────────┘ └─────────────────┘              │
+│                                                                             │
+│                          DATA PLANE                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**What Sidecar Handles (WITHOUT Code Changes):**
+
+| Category | Capabilities |
+|----------|--------------|
+| **Traffic** | Load balancing, rate limiting, traffic routing, canary deployments |
+| **Security** | mTLS, JWT validation, authorization policies |
+| **Resilience** | Circuit breaker, retries, timeouts |
+| **Observability** | Distributed tracing, metrics, logging (Fluentbit) |
+
+**All configured via YAML - NO CODE CHANGES!**
+
+---
+
+## 12. IoT vs Message Queues
+
+**They serve DIFFERENT purposes but work TOGETHER:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      IoT PROTOCOLS vs MESSAGE QUEUES                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   IoT PROTOCOLS                          MESSAGE QUEUES                     │
+│   ─────────────                          ──────────────                     │
+│                                                                             │
+│   Device ↔ Cloud communication           Service ↔ Service communication   │
+│   (Edge to Backend)                      (Backend to Backend)               │
+│                                                                             │
+│   Optimized for:                         Optimized for:                     │
+│   • Low bandwidth                        • High throughput                  │
+│   • Unreliable networks                  • Reliable delivery                │
+│   • Battery-powered devices              • Message persistence              │
+│   • Millions of connections              • Complex routing                  │
+│                                                                             │
+│   Examples:                              Examples:                          │
+│   • MQTT                                 • Apache Kafka                     │
+│   • CoAP                                 • RabbitMQ                         │
+│   • WebSocket                            • AWS SQS/SNS                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Typical Architecture - Used TOGETHER:**
+
+```
+Devices ──MQTT──► IoT Gateway ──► Kafka ──► Microservices
+```
+
+---
+
+## 13. Classic Design Patterns (Gang of Four)
+
+### Understanding Pattern Categories
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              DESIGN PATTERNS vs MICROSERVICE PATTERNS                        │
+│                        (DIFFERENT THINGS!)                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   DESIGN PATTERNS (GoF)                 MICROSERVICE PATTERNS               │
+│   ─────────────────────                 ─────────────────────               │
+│                                                                             │
+│   • Object-Oriented patterns            • Distributed system patterns       │
+│   • Code-level solutions                • Architecture-level solutions      │
+│   • Single application                  • Multiple services                 │
+│   • Gang of Four (1994 book)            • Chris Richardson, Sam Newman      │
+│                                                                             │
+│   Examples:                             Examples:                           │
+│   • Singleton                           • API Gateway                       │
+│   • Factory                             • Circuit Breaker                   │
+│   • Observer                            • Saga                              │
+│   • Strategy                            • CQRS                              │
+│                                                                             │
+│   Scope: CLASS / OBJECT                 Scope: SERVICE / SYSTEM             │
+│                                                                             │
+│   ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│   IMPORTANT: Microservices is NOT a pattern!                                │
+│   Microservices is an ARCHITECTURAL STYLE / PRACTICE                        │
+│   that USES various patterns (API Gateway, Saga, etc.)                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Gang of Four - 23 Design Patterns
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    23 GoF DESIGN PATTERNS                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   CREATIONAL (5)              STRUCTURAL (7)          BEHAVIORAL (11)       │
+│   How objects created         How objects composed    How objects interact  │
+│   ──────────────────          ────────────────────    ────────────────────  │
+│                                                                             │
+│   ★ Singleton                 ★ Adapter               ★ Observer            │
+│   ★ Factory Method            ★ Decorator             ★ Strategy            │
+│   ★ Builder                   ★ Facade                ★ Command             │
+│     Abstract Factory            Proxy                   Template Method     │
+│     Prototype                   Composite               Iterator            │
+│                                 Bridge                  State               │
+│                                 Flyweight               Chain of Resp       │
+│                                                         Mediator            │
+│                                                         Memento             │
+│                                                         Visitor             │
+│                                                         Interpreter         │
+│                                                                             │
+│   ★ = Most commonly asked in interviews                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key GoF Patterns Quick Reference
+
+| Pattern | Category | Purpose | Example |
+|---------|----------|---------|---------|
+| **Singleton** | Creational | One instance only | Database connection |
+| **Factory** | Creational | Create without specifying class | Document creators |
+| **Builder** | Creational | Step-by-step construction | StringBuilder |
+| **Adapter** | Structural | Convert interface | Arrays.asList() |
+| **Decorator** | Structural | Add behavior dynamically | Java I/O streams |
+| **Facade** | Structural | Simplify complex system | JDBC DriverManager |
+| **Observer** | Behavioral | Event notification | Event listeners |
+| **Strategy** | Behavioral | Swap algorithms | Comparator |
+| **Command** | Behavioral | Encapsulate request | Undo/Redo |
+
+### Front Controller Pattern
+
+**Enterprise pattern** providing single entry point for web applications:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FRONT CONTROLLER                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌────────┐                ┌──────────────────┐     ┌─────────────┐       │
+│   │        │   ALL requests │                  │     │  Controller │       │
+│   │ Client │───────────────►│ FRONT CONTROLLER │────►│  Controller │       │
+│   │        │                │   (Dispatcher)   │────►│  Controller │       │
+│   └────────┘                │                  │     └─────────────┘       │
+│                             │ • Auth           │                           │
+│                             │ • Logging        │     Spring MVC:           │
+│                             │ • Route          │     DispatcherServlet     │
+│                             └──────────────────┘     is Front Controller!  │
+│                                                                             │
+│   Front Controller (app level) ≈ API Gateway (system level)                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 14. Interview Tips: Pattern Questions
+
+### How to Answer "What Design Patterns Do You Know?"
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    INTERVIEW STRATEGY                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   OPTION 1: CLARIFY PROFESSIONALLY                                          │
+│   ────────────────────────────────                                          │
+│                                                                             │
+│   "Are you asking about classic GoF design patterns like Singleton          │
+│    and Factory, or architectural patterns like API Gateway and              │
+│    Circuit Breaker? I can cover both."                                      │
+│                                                                             │
+│   OPTION 2: ANSWER BOTH                                                     │
+│   ─────────────────────                                                     │
+│                                                                             │
+│   "I work with patterns at multiple levels:                                 │
+│                                                                             │
+│    At the code level - GoF patterns like Factory, Strategy, Observer        │
+│    for object-oriented design.                                              │
+│                                                                             │
+│    At the architecture level - patterns like API Gateway, Circuit           │
+│    Breaker, Saga for microservices.                                         │
+│                                                                             │
+│    Which area would you like to explore?"                                   │
+│                                                                             │
+│   ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│   QUICK GUIDE:                                                              │
+│   ─────────────                                                             │
+│   "What design patterns?" → Probably GoF (Singleton, Factory...)            │
+│   "What microservice patterns?" → API Gateway, Saga, CQRS...                │
+│   "What patterns in your projects?" → BOTH!                                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Quick Reference Table
 
 | Challenge | Pattern |
 |-----------|---------|
 | Service boundaries | Decompose by Business/Subdomain |
 | Single entry point | API Gateway |
-| Distributed transactions | Saga |
+| Distributed transactions | Saga (Choreography/Orchestration) |
 | Data isolation | Database per Service |
+| Heavy read systems | CQRS |
 | Service location | Service Discovery |
 | Fault tolerance | Circuit Breaker, Retry, Bulkhead |
 | Cross-service debugging | Distributed Tracing |
 | Gradual migration | Strangler Fig |
 | Different tech requirements | Polyglot Microservices |
+| Traffic control without code | Service Mesh |
+| Object creation | Factory, Builder, Singleton (GoF) |
+| Algorithm flexibility | Strategy (GoF) |
+| Event handling | Observer (GoF) |
+
+---
+
+## Pattern Categories Summary
+
+| Category | Level | Examples |
+|----------|-------|----------|
+| **Architectural Style** | System | Microservices, Monolith, Serverless |
+| **Microservice Patterns** | Service/System | API Gateway, Saga, CQRS, Circuit Breaker |
+| **Enterprise Patterns** | Application | Repository, Unit of Work, Front Controller |
+| **Design Patterns (GoF)** | Class/Object | Singleton, Factory, Observer, Strategy |
 
 ---
 
