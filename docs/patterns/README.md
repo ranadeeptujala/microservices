@@ -21,6 +21,8 @@ Microservice design patterns are proven solutions to common challenges when buil
 | 11 | [IoT vs Message Queues](./11-iot-vs-message-queues.md) | MQTT vs Kafka, when to use what |
 | 12 | [Design Patterns (GoF)](./12-design-patterns-gof.md) | Classic OOP patterns vs Microservice patterns |
 | 13 | [Interview Tips](./13-interview-tips.md) | How to answer pattern questions |
+| 14 | [Streaming System Design](./14-streaming-system-design.md) | Netflix/YouTube architecture, HLS, CDN |
+| 15 | [Microservices Interview Q&A](./15-microservices-interview-qa.md) | 29 practical questions with answers |
 
 ---
 

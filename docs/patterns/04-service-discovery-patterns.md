@@ -116,17 +116,172 @@ Client only knows ONE address - the load balancer/gateway!
 
 ## Modern Server-Side Discovery Options
 
-### Option 1: AWS ALB/NLB (Most Common for AWS)
+### Option 1: AWS Route53 + ALB + CloudFront
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     AWS ALB Architecture                         │
+│              AWS ARCHITECTURE: STATIC + DYNAMIC                  │
+├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│   Client ──► Route53 (DNS) ──► ALB ──► Target Group ──► ECS/EKS │
+│                      ┌──────────────┐                           │
+│                      │   Route53    │                           │
+│                      │    (DNS)     │                           │
+│                      └──────┬───────┘                           │
+│                             │                                    │
+│            ┌────────────────┴────────────────┐                  │
+│            │                                 │                  │
+│            ▼                                 ▼                  │
+│   ┌─────────────────┐               ┌─────────────────┐        │
+│   │   CloudFront    │               │      ALB        │        │
+│   │   (CDN + S3)    │               │  (Load Balancer)│        │
+│   │                 │               │                 │        │
+│   │ Static Content: │               │ Dynamic APIs:   │        │
+│   │ • React/Vue SPA │               │ • /api/orders   │        │
+│   │ • Images, CSS   │               │ • /api/payments │        │
+│   │ • JS bundles    │               │ • /api/users    │        │
+│   └────────┬────────┘               └────────┬────────┘        │
+│            │                                 │                  │
+│            ▼                                 ▼                  │
+│   ┌─────────────────┐               ┌─────────────────┐        │
+│   │       S3        │               │   ECS / EKS     │        │
+│   │  (Static Files) │               │  (Microservices)│        │
+│   └─────────────────┘               └─────────────────┘        │
 │                                                                  │
-│   DNS: api.example.com → ALB DNS                                │
-│   ALB: Handles health checks, routing, SSL termination          │
-│   Target Group: Auto-discovers healthy instances                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Route53 Configuration:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              ROUTE53 DNS RECORDS                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  example.com        → CloudFront (static SPA)                   │
+│  www.example.com    → CloudFront (static SPA)                   │
+│  api.example.com    → ALB (microservices)                       │
+│                                                                  │
+│  Route53 Alias Records:                                         │
+│  • example.com      → d1234.cloudfront.net                     │
+│  • api.example.com  → alb-1234.us-east-1.elb.amazonaws.com     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**CloudFront for Static Content:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              CLOUDFRONT BENEFITS                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ✅ Global CDN - Edge locations worldwide (low latency)         │
+│  ✅ Caching - Don't hit S3 for every request                   │
+│  ✅ HTTPS - Free SSL certificate via ACM                        │
+│  ✅ DDoS Protection - AWS Shield Standard included              │
+│  ✅ Compression - Gzip/Brotli automatic                         │
+│  ✅ Cost - S3 + CloudFront cheaper than serving from ALB        │
+│                                                                  │
+│  Use for:                                                       │
+│  • Single Page Apps (React, Vue, Angular)                       │
+│  • Static websites                                              │
+│  • Images, videos, downloads                                    │
+│  • CSS, JavaScript bundles                                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**ALB for Dynamic APIs:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              ALB ROUTING                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  api.example.com/orders/*   → Order Service Target Group        │
+│  api.example.com/payments/* → Payment Service Target Group      │
+│  api.example.com/users/*    → User Service Target Group         │
+│                                                                  │
+│  ALB handles:                                                   │
+│  • SSL termination                                              │
+│  • Path-based routing                                           │
+│  • Health checks                                                │
+│  • Auto-scaling integration                                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Global Accelerator for Active-Active Multi-Region:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              AWS GLOBAL ACCELERATOR                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                     ┌─────────────────────┐                     │
+│                     │  Global Accelerator │                     │
+│                     │  Static IPs:        │                     │
+│                     │  • 75.2.xxx.xxx     │                     │
+│                     │  • 99.83.xxx.xxx    │                     │
+│                     └──────────┬──────────┘                     │
+│                                │                                 │
+│           ┌────────────────────┴────────────────────┐           │
+│           │                                         │           │
+│           ▼                                         ▼           │
+│   ┌───────────────┐                        ┌───────────────┐   │
+│   │  US-EAST-1    │        ACTIVE          │  EU-WEST-1    │   │
+│   │  (50% traffic)│◄──────ACTIVE──────────►│  (50% traffic)│   │
+│   │               │                        │               │   │
+│   │  ┌─────────┐  │                        │  ┌─────────┐  │   │
+│   │  │   ALB   │  │                        │  │   ALB   │  │   │
+│   │  └────┬────┘  │                        │  └────┬────┘  │   │
+│   │       │       │                        │       │       │   │
+│   │  ┌────▼────┐  │                        │  ┌────▼────┐  │   │
+│   │  │   ECS   │  │                        │  │   ECS   │  │   │
+│   │  └─────────┘  │                        │  └─────────┘  │   │
+│   └───────────────┘                        └───────────────┘   │
+│                                                                  │
+│  BOTH regions serve traffic simultaneously!                     │
+│  If one fails → 100% to healthy region (instant failover)      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Route53 vs Global Accelerator:**
+```
+┌──────────────────────────────────────────────────────────────────┐
+│              COMPARISON: ROUTE53 vs GLOBAL ACCELERATOR           │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌───────────────┬─────────────────┬─────────────────────────┐   │
+│  │ Feature       │ Route53         │ Global Accelerator      │   │
+│  ├───────────────┼─────────────────┼─────────────────────────┤   │
+│  │ Mode          │ Active-Passive  │ Active-Active ✅        │   │
+│  │ IPs           │ DNS (changes)   │ Static anycast IPs      │   │
+│  │ Failover      │ DNS TTL (~60s)  │ Instant (<30s) ✅       │   │
+│  │ Network       │ Public internet │ AWS global network ✅   │   │
+│  │ Cost          │ Cheaper         │ More expensive          │   │
+│  │ Use case      │ Standard apps   │ Real-time, gaming, API  │   │
+│  └───────────────┴─────────────────┴─────────────────────────┘   │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**When to use Global Accelerator:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              USE GLOBAL ACCELERATOR WHEN:                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ✅ Need active-active multi-region                             │
+│  ✅ Real-time applications (gaming, video, trading)             │
+│  ✅ Need instant failover (not DNS TTL dependent)               │
+│  ✅ Static IPs required (firewall whitelisting)                 │
+│  ✅ Global users need low latency                               │
+│  ✅ Want to avoid public internet hops                          │
+│                                                                  │
+│  USE ROUTE53 WHEN:                                              │
+│  ✅ Active-passive is sufficient                                │
+│  ✅ Cost-sensitive                                              │
+│  ✅ Standard web applications                                   │
+│  ✅ Single region deployment                                    │
+│                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
